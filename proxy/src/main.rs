@@ -41,9 +41,6 @@ mod multicast_config;
 mod server;
 mod token_authenticator;
 
-const SHREDSTREAM_SHUTDOWN_DATE: &str = "September 5, 2026";
-const SHREDSTREAM_SHUTDOWN_UNIX_SECONDS: u64 = 1_788_566_400;
-
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version, about, long_about = None)]
 // https://docs.rs/clap/latest/clap/_derive/_cookbook/git_derive/index.html
@@ -167,8 +164,6 @@ pub enum ShredstreamProxyError {
     RecvError(#[from] RecvError),
     #[error("IoError {0}")]
     IoError(#[from] io::Error),
-    #[error("Shutdown")]
-    Shutdown,
 }
 
 fn resolve_hostname_port(hostname_port: &str) -> io::Result<(SocketAddr, String)> {
@@ -193,13 +188,6 @@ pub fn get_public_ip() -> reqwest::Result<IpAddr> {
     info!("Retrieved public ip: {public_ip:?}");
 
     Ok(public_ip)
-}
-
-fn shutdown_has_passed() -> bool {
-    std::time::UNIX_EPOCH
-        .elapsed()
-        .map(|elapsed| elapsed.as_secs() >= SHREDSTREAM_SHUTDOWN_UNIX_SECONDS)
-        .unwrap_or(false)
 }
 
 // Creates a channel that gets a message every time `SIGINT` is signalled.
@@ -234,14 +222,9 @@ fn main() -> Result<(), ShredstreamProxyError> {
     if matches!(&shredstream_args, ProxySubcommands::Shredstream(_)) {
         eprintln!(
             "\n\
-Jito ShredStream is deprecated and will shut down on {SHREDSTREAM_SHUTDOWN_DATE}.\n\
-Migrate to DoubleZero Edge: https://doublezero.xyz/jito-shredstream\n\
-Support: https://discord.com/invite/doublezerotech (#jito-shredstream)\n"
+This is the AllenHark-maintained ShredStream proxy, a drop-in replacement for Jito's \
+(which shut down September 5, 2026). Point --block-engine-url at your AllenHark gateway.\n"
         );
-        if shutdown_has_passed() {
-            warn!("ShredStream has been shut down on {SHREDSTREAM_SHUTDOWN_DATE}");
-            return Err(ShredstreamProxyError::Shutdown);
-        }
     }
 
     // common args
