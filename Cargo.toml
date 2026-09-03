@@ -35,6 +35,8 @@ solana-ledger = { git = "https://github.com/jito-foundation/jito-solana.git", br
 solana-metrics = "=2.2.1"
 solana-net-utils = "=2.2.1"
 solana-perf = "=2.2.1"
+socket2 = "0.5"
+libc = "0.2"
 solana-sdk = "=2.2.1"
 solana-streamer = "=2.2.1"
 thiserror = "2"

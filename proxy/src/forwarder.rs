@@ -43,6 +43,99 @@ pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 pub const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
 pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 
+/// Default UDP receive-buffer size requested on every listener socket. The shred
+/// firehose is the full raw turbine stream (~90 Mbit/s of small UDP datagrams),
+/// far heavier than a default receive buffer can absorb — an untuned box drops
+/// most of it and sees only a trickle. 128 MiB matches the relay/gateway tuning.
+///
+/// NOTE: `SO_RCVBUF` is capped by `net.core.rmem_max`, so this only takes full
+/// effect when the host's `rmem_max` is at least this large; otherwise the
+/// kernel silently clamps us and we log an actionable warning (see below).
+pub const TARGET_RECV_BUF_BYTES: usize = 128 * 1024 * 1024;
+
+/// Below this achieved size the kernel clamped our request (`rmem_max` too low),
+/// so datagrams will be dropped under load — warn the operator.
+pub const MIN_HEALTHY_RECV_BUF_BYTES: usize = 8 * 1024 * 1024;
+
+/// Returns an actionable warning when the achieved `SO_RCVBUF` is too small to
+/// absorb the shred firehose (kernel clamped by `net.core.rmem_max`), else None.
+fn recv_buf_warning(achieved_bytes: usize) -> Option<String> {
+    if achieved_bytes < MIN_HEALTHY_RECV_BUF_BYTES {
+        Some(format!(
+            "UDP receive buffer is only {} KiB — the kernel clamped our {} MiB request via net.core.rmem_max. \
+             The shred firehose (~90 Mbit/s of small UDP) will overflow it and drop most datagrams, so you will \
+             see only a fraction of each block. Raise it: sudo sysctl -w net.core.rmem_max={} net.core.rmem_default={} \
+             (persist in /etc/sysctl.d/), then restart the proxy.",
+            achieved_bytes / 1024,
+            TARGET_RECV_BUF_BYTES / (1024 * 1024),
+            TARGET_RECV_BUF_BYTES,
+            TARGET_RECV_BUF_BYTES,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Request a large `SO_RCVBUF` on `sock`, read back what the kernel granted, and
+/// warn (with the fix) if it was clamped below a healthy size.
+///
+/// Two-step: first the portable `SO_RCVBUF` (capped by `net.core.rmem_max`); if
+/// the kernel clamped us, try the privileged `SO_RCVBUFFORCE` (Linux + root /
+/// `CAP_NET_ADMIN`), which bypasses `rmem_max`. When neither yields a healthy
+/// buffer (unprivileged host with a low `rmem_max`), we log the actionable fix.
+fn tune_recv_buffer(sock: &UdpSocket) {
+    let sr = socket2::SockRef::from(sock);
+    if let Err(e) = sr.set_recv_buffer_size(TARGET_RECV_BUF_BYTES) {
+        warn!("Failed to set UDP receive buffer size: {e}");
+    }
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut achieved = sr.recv_buffer_size().unwrap_or(0);
+
+    // If rmem_max clamped the portable request, try to force past it (root only).
+    #[cfg(target_os = "linux")]
+    if achieved < TARGET_RECV_BUF_BYTES && force_recv_buffer(sock, TARGET_RECV_BUF_BYTES) {
+        achieved = sr.recv_buffer_size().unwrap_or(achieved);
+        info!("Applied SO_RCVBUFFORCE (root) to bypass net.core.rmem_max");
+    }
+
+    match recv_buf_warning(achieved) {
+        Some(w) => warn!("{w}"),
+        None => info!(
+            "UDP receive buffer set to {} MiB per listener",
+            achieved / (1024 * 1024)
+        ),
+    }
+}
+
+/// Set `SO_RCVBUFFORCE`, which ignores `net.core.rmem_max` but requires
+/// `CAP_NET_ADMIN` (root). Returns true on success; a failure (typically `EPERM`
+/// when unprivileged) is expected and handled by the caller's warning path.
+#[cfg(target_os = "linux")]
+fn force_recv_buffer(sock: &UdpSocket, bytes: usize) -> bool {
+    use std::os::fd::AsRawFd;
+    let val = bytes as libc::c_int;
+    // SAFETY: `fd` is a valid, open socket owned by `sock` for the duration of
+    // this call; we pass a correctly-typed `c_int` option value and its length.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        debug!(
+            "SO_RCVBUFFORCE not applied ({}); likely missing CAP_NET_ADMIN (not root)",
+            std::io::Error::last_os_error()
+        );
+        false
+    } else {
+        true
+    }
+}
+
 /// Bind to ports and start forwarding shreds
 #[allow(clippy::too_many_arguments)]
 pub fn start_forwarder_threads(
@@ -76,6 +169,18 @@ pub fn start_forwarder_threads(
     .unwrap_or_else(|_| {
         panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
     });
+
+    // Enlarge the kernel receive buffer on every listener so the full raw shred
+    // firehose is absorbed without drops. Applied before the sockets are moved
+    // into the receiver threads below.
+    for sock in &sockets {
+        tune_recv_buffer(sock);
+    }
+    if let Some(mcast) = maybe_multicast_socket.as_ref() {
+        for sock in mcast {
+            tune_recv_buffer(sock);
+        }
+    }
 
     let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
@@ -618,7 +723,40 @@ mod tests {
     };
     use solana_sdk::packet::{PacketFlags, PACKET_DATA_SIZE};
 
-    use crate::forwarder::{recv_from_channel_and_send_multiple_dest, ShredMetrics};
+    use crate::forwarder::{
+        recv_buf_warning, tune_recv_buffer, ShredMetrics, MIN_HEALTHY_RECV_BUF_BYTES,
+    };
+    use crate::forwarder::recv_from_channel_and_send_multiple_dest;
+
+    #[test]
+    fn recv_buf_warning_warns_when_kernel_clamps() {
+        // ~416 KiB — a default net.core.rmem_max (~208 KiB, doubled by the kernel).
+        let w = recv_buf_warning(425_984).expect("small buffer should warn");
+        assert!(w.contains("net.core.rmem_max"), "warning must be actionable");
+    }
+
+    #[test]
+    fn recv_buf_warning_silent_when_large() {
+        assert!(recv_buf_warning(256 * 1024 * 1024).is_none());
+    }
+
+    #[test]
+    fn recv_buf_warning_boundary() {
+        assert!(recv_buf_warning(MIN_HEALTHY_RECV_BUF_BYTES - 1).is_some());
+        assert!(recv_buf_warning(MIN_HEALTHY_RECV_BUF_BYTES).is_none());
+    }
+
+    #[test]
+    fn tune_recv_buffer_enlarges_a_real_socket() {
+        // Binds a loopback socket, requests the large buffer, and confirms the
+        // kernel granted more than the default (exact value depends on rmem_max,
+        // so we only assert it grew past a tiny floor rather than a fixed size).
+        let sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        let before = socket2::SockRef::from(&sock).recv_buffer_size().unwrap_or(0);
+        tune_recv_buffer(&sock);
+        let after = socket2::SockRef::from(&sock).recv_buffer_size().unwrap_or(0);
+        assert!(after >= before, "buffer must not shrink (before={before}, after={after})");
+    }
 
     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
         let mut buf = [0u8; PACKET_DATA_SIZE];
