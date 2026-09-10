@@ -13,11 +13,13 @@ downstream service).
 ## Migrating from Jito
 
 No code changes are required. Point `--block-engine-url` (and `--auth-url`
-if you use a separate one) at your AllenHark region gateway instead of
-Jito's, keep using your existing auth keypair, and register that keypair's
-pubkey in the AllenHark console/dashboard so it gets whitelisted. Everything
-else — `--desired-regions`, `--dest-ip-ports`, `--src-bind-port`, etc. —
-works exactly as before.
+if you use a separate one) at the AllenHark gateway instead of Jito's, keep
+using your existing auth keypair, and register that keypair's pubkey in the
+AllenHark console/dashboard so it gets whitelisted. Everything else —
+`--dest-ip-ports`, `--src-bind-port`, etc. — works exactly as before.
+
+The AllenHark gateway serves **Frankfurt only**. `--desired-regions` is
+accepted for CLI compatibility but is not used for routing.
 
 ## Setup
 
@@ -27,8 +29,14 @@ works exactly as before.
    to hold funds.
 2. **Whitelist your keypair**: Register the keypair's pubkey in the
    AllenHark console/dashboard to get it whitelisted for ShredStream access.
-3. **Point at your region gateway**: Use the AllenHark gateway URL for the
-   region you want, e.g. `https://<region>.shreds.allenhark.network`.
+   One pubkey per subscription, one subscription per account.
+3. **Point at the gateway**: `https://fra.jito.allenhark.network`
+   (Frankfurt).
+
+## Access
+
+Jito Shreds is **$50/month**, with a **24-hour trial** available per account.
+Manage the subscription and the whitelisted pubkey in the AllenHark console.
 
 ## Running
 
@@ -36,16 +44,14 @@ works exactly as before.
 
 ```bash
 RUST_LOG=info cargo run --release --bin jito-shredstream-proxy -- shredstream \
-  --block-engine-url https://<region>.shreds.allenhark.network \
+  --block-engine-url https://fra.jito.allenhark.network \
   --auth-keypair shredstream-keypair.json \
-  --desired-regions <region1>,<region2> \
   --dest-ip-ports 127.0.0.1:8001,10.0.0.1:8001
 ```
 
-- `--block-engine-url`: your AllenHark gateway URL for the desired region.
+- `--block-engine-url`: the AllenHark gateway URL,
+  `https://fra.jito.allenhark.network`.
 - `--auth-keypair`: path to your (whitelisted) auth keypair file.
-- `--desired-regions`: comma-separated list of regions to receive shreds
-  from (max 2).
 - `--dest-ip-ports`: comma-separated `IP:PORT` destinations to forward
   decoded shreds to (e.g. your validator's TVU port, found via
   `scripts/get_tvu_port.sh`).
@@ -63,9 +69,8 @@ docker run -d --network host \
   -v $(pwd)/shredstream-keypair.json:/app/shredstream-keypair.json \
   allenhark-shredstream-proxy \
   shredstream \
-  --block-engine-url https://<region>.shreds.allenhark.network \
+  --block-engine-url https://fra.jito.allenhark.network \
   --auth-keypair /app/shredstream-keypair.json \
-  --desired-regions <region1>,<region2> \
   --dest-ip-ports 127.0.0.1:8001
 ```
 
