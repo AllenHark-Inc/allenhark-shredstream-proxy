@@ -34,11 +34,14 @@ use crate::{
     forwarder::ShredMetrics, multicast_config::create_multicast_socket_on_device,
     token_authenticator::BlockEngineConnectionError,
 };
+// The original Jito deshredder, kept for its tests; the forwarder uses `shreds`.
+#[allow(dead_code)]
 mod deshred;
 pub mod forwarder;
 mod heartbeat;
 mod multicast_config;
 mod server;
+mod shreds;
 mod token_authenticator;
 
 #[derive(Clone, Debug, Parser)]

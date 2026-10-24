@@ -443,7 +443,7 @@ fn update_state_tracker(shred: &Shred, state_tracker: &mut ShredsStateTracker) -
     Some(index)
 }
 
-const SLOT_LOOKBACK: Slot = 50;
+pub(crate) const SLOT_LOOKBACK: Slot = 50;
 
 /// check if we can reconstruct (having minimum number of data + coding shreds)
 fn get_data_shred_info(
