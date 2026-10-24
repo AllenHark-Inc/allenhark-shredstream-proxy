@@ -40,6 +40,23 @@ Manage the subscription and the whitelisted pubkey in the AllenHark console.
 
 ## Running
 
+### Prebuilt binary
+
+Each [release](https://github.com/AllenHark-Inc/allenhark-shredstream-proxy/releases)
+has a Linux x86-64 binary built for generic x86-64 CPUs (no AVX2 needed) and
+glibc 2.29 or newer (Ubuntu 20.04+, Debian 11+), with its SHA-256 checksum.
+
+```bash
+curl -LO https://github.com/AllenHark-Inc/allenhark-shredstream-proxy/releases/latest/download/jito-shredstream-proxy-x86_64-unknown-linux-gnu
+curl -LO https://github.com/AllenHark-Inc/allenhark-shredstream-proxy/releases/latest/download/jito-shredstream-proxy-x86_64-unknown-linux-gnu.sha256
+sha256sum -c jito-shredstream-proxy-x86_64-unknown-linux-gnu.sha256
+chmod +x jito-shredstream-proxy-x86_64-unknown-linux-gnu
+RUST_LOG=info ./jito-shredstream-proxy-x86_64-unknown-linux-gnu shredstream \
+  --block-engine-url https://fra.jito.allenhark.network \
+  --auth-keypair shredstream-keypair.json \
+  --dest-ip-ports 127.0.0.1:8001
+```
+
 ### With Cargo
 
 ```bash

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,7 +16,6 @@ use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
 use log::{debug, error, info, warn};
 use prost::Message;
 use solana_client::client_error::reqwest;
-use solana_ledger::shred::ReedSolomonCache;
 use solana_metrics::{datapoint_info, datapoint_warn};
 use solana_net_utils::SocketConfig;
 use solana_perf::{
@@ -25,7 +23,6 @@ use solana_perf::{
     packet::{PacketBatch, PacketBatchRecycler},
     recycler::Recycler,
 };
-use solana_sdk::clock::Slot;
 use solana_streamer::{
     sendmmsg::{batch_send, SendPktsError},
     streamer::{self, StreamerReceiveStats},
@@ -33,8 +30,8 @@ use solana_streamer::{
 use tokio::sync::broadcast::Sender;
 
 use crate::{
-    deshred,
-    deshred::{ComparableShred, ShredsStateTracker},
+    deshred::SLOT_LOOKBACK,
+    shreds,
     resolve_hostname_port, ShredstreamProxyError,
 };
 
@@ -182,50 +179,50 @@ pub fn start_forwarder_threads(
         }
     }
 
-    let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
+    let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded::<PacketBatch>(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
 
     if should_reconstruct_shreds {
         let metrics = metrics.clone();
         let exit = exit.clone();
-        // receives shreds from recv_from_channel_and_send_multiple_dest and calls deshred::reconstruct_shreds
+        // receives shreds from recv_from_channel_and_send_multiple_dest and deshreds them with
+        // shreds::Deshredder (Alpenglow's fixed FEC sets and block markers, transaction v1). Each
+        // completed entry batch is sent as its raw bytes, undecoded, so a batch holding a v1
+        // transaction is no longer lost; block markers (entry count 0) are not entries and are
+        // not sent.
         let hdl = std::thread::Builder::new()
             .name("shred_reconstructor".to_string())
             .spawn(move || {
-                let mut all_shreds = ahash::HashMap::<
-                    Slot,
-                    (
-                        ahash::HashMap<u32, HashSet<ComparableShred>>,
-                        ShredsStateTracker,
-                    ),
-                >::default();
-                let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
-                let mut deshredded_entries =
-                    Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
-                let mut highest_slot_seen: Slot = 0;
-                let rs_cache = ReedSolomonCache::default();
+                let mut deshredder = shreds::Deshredder::new(SLOT_LOOKBACK);
+                let mut recovered_seen = 0u64;
 
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(pkt_batch) => {
-                            deshred::reconstruct_shreds(
-                                pkt_batch,
-                                &mut all_shreds,
-                                &mut slot_fec_indexes_to_iterate,
-                                &mut deshredded_entries,
-                                &mut highest_slot_seen,
-                                &rs_cache,
-                                &metrics,
-                            );
-
-                            deshredded_entries.drain(..).for_each(
-                                |(slot, _entries, entries_bytes)| {
+                            for packet in pkt_batch.iter().filter_map(|p| p.data(..)) {
+                                for batch in deshredder.push(packet) {
+                                    let Some(count) = batch
+                                        .bytes
+                                        .get(..8)
+                                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                                    else {
+                                        continue;
+                                    };
+                                    if count == 0 {
+                                        continue; // an Alpenglow block marker
+                                    }
+                                    metrics.entry_count.fetch_add(count, Ordering::Relaxed);
                                     let _ = entry_sender.send(PbEntry {
-                                        slot,
-                                        entries: entries_bytes,
+                                        slot: batch.slot,
+                                        entries: batch.bytes,
                                     });
-                                },
-                            );
+                                }
+                            }
+                            let recovered = deshredder.stats.recovered_data_shreds;
+                            metrics
+                                .recovered_count
+                                .fetch_add(recovered - recovered_seen, Ordering::Relaxed);
+                            recovered_seen = recovered;
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {} // do nothing
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
